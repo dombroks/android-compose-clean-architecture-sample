@@ -5,8 +5,8 @@ package com.eslam.bakingapp.features.login.presentation
  * Immutable data class following MVI pattern.
  */
 data class LoginUiState(
-    val email: String = "",
-    val password: String = "",
+    val email: String = "test@example.com",
+    val password: String = "Password123",
     val emailError: String? = null,
     val passwordError: String? = null,
     val isLoading: Boolean = false,

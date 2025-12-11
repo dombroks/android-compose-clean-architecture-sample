@@ -70,18 +70,16 @@ class CookingTimerActivity : AppCompatActivity() {
     /**
      * Custom lifecycle observer to demonstrate lifecycle awareness.
      */
-    private val lifecycleObserver = object : LifecycleEventObserver {
-        override fun onStateChanged(source: LifecycleOwner, event: Lifecycle.Event) {
-            Log.d(TAG, "Lifecycle event: ${event.name}")
-            when (event) {
-                Lifecycle.Event.ON_CREATE -> onLifecycleCreate()
-                Lifecycle.Event.ON_START -> onLifecycleStart()
-                Lifecycle.Event.ON_RESUME -> onLifecycleResume()
-                Lifecycle.Event.ON_PAUSE -> onLifecyclePause()
-                Lifecycle.Event.ON_STOP -> onLifecycleStop()
-                Lifecycle.Event.ON_DESTROY -> onLifecycleDestroy()
-                else -> {}
-            }
+    private val lifecycleObserver = LifecycleEventObserver { source, event ->
+        Log.d(TAG, "Lifecycle event: ${event.name}")
+        when (event) {
+            Lifecycle.Event.ON_CREATE -> onLifecycleCreate()
+            Lifecycle.Event.ON_START -> onLifecycleStart()
+            Lifecycle.Event.ON_RESUME -> onLifecycleResume()
+            Lifecycle.Event.ON_PAUSE -> onLifecyclePause()
+            Lifecycle.Event.ON_STOP -> onLifecycleStop()
+            Lifecycle.Event.ON_DESTROY -> onLifecycleDestroy()
+            else -> {}
         }
     }
     
@@ -361,5 +359,10 @@ class CookingTimerActivity : AppCompatActivity() {
     
     private fun onLifecycleDestroy() {
         Log.d(TAG, "LifecycleObserver: ON_DESTROY")
+    }
+
+    override fun onRestart() {
+        super.onRestart()
+        Log.d(TAG, "LifecycleObserver: ON_RESTART")
     }
 }
