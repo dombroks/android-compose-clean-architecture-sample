@@ -9,19 +9,25 @@ import com.eslam.metrics.internal.bridge.EventType
 import com.eslam.metrics.internal.bridge.NativeBridge
 import com.eslam.metrics.internal.bridge.NativeEventCallback
 import com.eslam.metrics.internal.capture.ScreenshotManager
+import com.eslam.metrics.internal.capture.TouchInterceptor
 import com.eslam.metrics.internal.detection.AnrWatchdog
 import com.eslam.metrics.internal.detection.CrashHandler
 import com.eslam.metrics.internal.detection.MemoryMonitor
 import com.eslam.metrics.internal.lifecycle.LifecycleTracker
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
-import java.io.File
 
 /**
  * MetricsSDK - Public API for Session Recording & Metrics
  *
  * A high-performance, lightweight SDK for capturing user sessions,
  * performance bottlenecks, and visual context without blocking the UI thread.
+ *
+ * Features:
+ * - Automatic screenshot capture on touch/click events
+ * - Screenshot on page/activity changes
+ * - Screenshot on tracked actions and heavy actions
+ * - Throttling to prevent excessive screenshots (configurable interval)
  *
  * Usage:
  * ```
@@ -39,7 +45,6 @@ import java.io.File
 object MetricsSDK {
 
     private const val TAG = "MetricsSDK"
-    private const val SCREENSHOTS_DIR = "metrics_screenshots"
 
     private var isInitialized = false
     private var config = MetricsConfig()
@@ -52,6 +57,7 @@ object MetricsSDK {
     private lateinit var memoryMonitor: MemoryMonitor
     private lateinit var anrWatchdog: AnrWatchdog
     private lateinit var crashHandler: CrashHandler
+    private lateinit var touchInterceptor: TouchInterceptor
 
     private val moshi = Moshi.Builder()
         .addLast(KotlinJsonAdapterFactory())
@@ -100,16 +106,7 @@ object MetricsSDK {
     private fun initializeComponents() {
         // Initialize native bridge
         nativeBridge = NativeBridge()
-        val storageDir = File(application.filesDir, SCREENSHOTS_DIR).apply { mkdirs() }
-        nativeBridge.nativeInit(storageDir.absolutePath)
-
-        // Set native config
-        nativeBridge.nativeSetImageConfig(
-            config.screenshotWidth,
-            config.screenshotHeight,
-            config.screenshotQuality,
-            false // Use JPEG
-        )
+        nativeBridge.nativeInit(application.filesDir.absolutePath)
 
         // Set event callback
         nativeBridge.nativeSetEventCallback(object : NativeEventCallback {
@@ -121,8 +118,18 @@ object MetricsSDK {
         // Initialize repository
         repository = MetricsRepository(application)
 
-        // Initialize screenshot manager
-        screenshotManager = ScreenshotManager(nativeBridge, storageDir)
+        // Set native image processing config
+        nativeBridge.nativeSetImageConfig(
+            config.screenshotWidth,
+            config.screenshotHeight,
+            config.screenshotQuality
+        )
+
+        // Initialize screenshot manager - all processing in C++
+        screenshotManager = ScreenshotManager(
+            nativeBridge = nativeBridge,
+            minIntervalMs = config.screenshotIntervalMs
+        )
 
         // Initialize lifecycle tracker
         lifecycleTracker = LifecycleTracker(
@@ -133,6 +140,15 @@ object MetricsSDK {
             gracePeriodMs = config.gracePeriodMs
         )
         lifecycleTracker.start()
+
+        // Initialize touch interceptor for automatic screenshot on touch/click
+        if (config.enableScreenshots && config.enableTouchTracking) {
+            touchInterceptor = TouchInterceptor(
+                application = application,
+                onTouchEvent = ::onTouchEvent
+            )
+            touchInterceptor.start()
+        }
 
         // Initialize memory monitor
         if (config.enableMemoryMonitoring) {
@@ -179,7 +195,7 @@ object MetricsSDK {
     }
 
     /**
-     * Track a simple action/event.
+     * Track a simple action/event with automatic screenshot capture.
      *
      * @param name Action name
      */
@@ -194,15 +210,26 @@ object MetricsSDK {
             "{}"
         )
         
-        repository.recordEvent(
-            sessionId = sessionId,
-            eventType = EventType.CUSTOM,
-            eventName = name,
-            metadata = null,
-            screenshotPath = null,
-            memoryUsageMb = null,
-            cpuUsagePercent = null
-        )
+        // Capture screenshot for actions if enabled
+        if (config.enableScreenshots) {
+            captureScreenshotForEvent(
+                eventName = "action_$name",
+                sessionId = sessionId,
+                metadata = null,
+                eventType = EventType.CUSTOM,
+                force = false
+            )
+        } else {
+            repository.recordEvent(
+                sessionId = sessionId,
+                eventType = EventType.CUSTOM,
+                eventName = name,
+                metadata = null,
+                screenshotData = null,
+                memoryUsageMb = null,
+                cpuUsagePercent = null
+            )
+        }
         
         log("Action tracked: $name")
     }
@@ -226,16 +253,22 @@ object MetricsSDK {
 
         nativeBridge.nativeRecordHeavyAction(name, metadataJson)
 
-        // Capture screenshot if enabled
+        // Capture screenshot if enabled (force=true for heavy actions)
         if (config.enableScreenshots) {
-            captureScreenshotForEvent(name, sessionId, metadataJson)
+            captureScreenshotForEvent(
+                eventName = "heavy_$name",
+                sessionId = sessionId,
+                metadata = metadataJson,
+                eventType = EventType.HEAVY_ACTION,
+                force = true // Heavy actions bypass throttling
+            )
         } else {
             repository.recordEvent(
                 sessionId = sessionId,
                 eventType = EventType.HEAVY_ACTION,
                 eventName = name,
                 metadata = metadataJson,
-                screenshotPath = null,
+                screenshotData = null,
                 memoryUsageMb = null,
                 cpuUsagePercent = null
             )
@@ -263,6 +296,64 @@ object MetricsSDK {
     @JvmStatic
     fun isInitialized(): Boolean = isInitialized
 
+    // ==================== Screenshot Export/Decode Utilities ====================
+
+    /**
+     * Decode a base64-encoded screenshot to JPEG bytes.
+     * Use this to convert stored screenshot data back to viewable images.
+     * 
+     * Example usage:
+     * ```kotlin
+     * val jpegBytes = MetricsSDK.decodeScreenshot(event.screenshotData)
+     * if (jpegBytes != null) {
+     *     // Save to file
+     *     File("screenshot.jpg").writeBytes(jpegBytes)
+     *     
+     *     // Or convert to Bitmap
+     *     val bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+     * }
+     * ```
+     * 
+     * @param base64Data Base64-encoded JPEG data from database
+     * @return JPEG bytes, or null if decoding fails
+     */
+    @JvmStatic
+    fun decodeScreenshot(base64Data: String?): ByteArray? {
+        if (!isInitialized || base64Data.isNullOrEmpty()) return null
+        return nativeBridge.nativeDecodeBase64ToBytes(base64Data)
+    }
+
+    /**
+     * Decode a base64-encoded screenshot to an Android Bitmap.
+     * 
+     * @param base64Data Base64-encoded JPEG data from database
+     * @return Bitmap, or null if decoding fails
+     */
+    @JvmStatic
+    fun decodeScreenshotToBitmap(base64Data: String?): android.graphics.Bitmap? {
+        val jpegBytes = decodeScreenshot(base64Data) ?: return null
+        return android.graphics.BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+    }
+
+    /**
+     * Save a base64-encoded screenshot to a file.
+     * 
+     * @param base64Data Base64-encoded JPEG data from database
+     * @param outputFile File to save the JPEG to
+     * @return true if saved successfully
+     */
+    @JvmStatic
+    fun saveScreenshotToFile(base64Data: String?, outputFile: java.io.File): Boolean {
+        val jpegBytes = decodeScreenshot(base64Data) ?: return false
+        return try {
+            outputFile.writeBytes(jpegBytes)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save screenshot", e)
+            false
+        }
+    }
+
     // Internal methods
 
     private fun onAppForeground() {
@@ -289,7 +380,35 @@ object MetricsSDK {
     }
 
     private fun onActivityResumed(activity: Activity) {
-        log("Activity resumed: ${activity.javaClass.simpleName}")
+        val activityName = activity.javaClass.simpleName
+        log("Activity resumed: $activityName")
+        
+        // Capture screenshot on page/activity change
+        if (config.enableScreenshots && config.captureOnPageChange) {
+            val sessionId = currentSessionId ?: return
+            captureScreenshotForEvent(
+                eventName = "page_$activityName",
+                sessionId = sessionId,
+                metadata = """{"activity":"$activityName"}""",
+                eventType = EventType.CUSTOM,
+                force = false
+            )
+        }
+    }
+
+    private fun onTouchEvent(activity: Activity, viewInfo: String) {
+        log("Touch event: $viewInfo on ${activity.javaClass.simpleName}")
+        
+        if (config.enableScreenshots) {
+            val sessionId = currentSessionId ?: return
+            captureScreenshotForEvent(
+                eventName = viewInfo,
+                sessionId = sessionId,
+                metadata = """{"view":"$viewInfo","activity":"${activity.javaClass.simpleName}"}""",
+                eventType = EventType.CUSTOM,
+                force = false
+            )
+        }
     }
 
     private fun onMemorySpike() {
@@ -297,14 +416,20 @@ object MetricsSDK {
         val sessionId = currentSessionId ?: return
 
         if (config.enableScreenshots) {
-            captureScreenshotForEvent("memory_spike", sessionId, null)
+            captureScreenshotForEvent(
+                eventName = "memory_spike",
+                sessionId = sessionId,
+                metadata = null,
+                eventType = EventType.MEMORY_SPIKE,
+                force = true // Critical event - bypass throttling
+            )
         } else {
             repository.recordEvent(
                 sessionId = sessionId,
                 eventType = EventType.MEMORY_SPIKE,
                 eventName = "memory_spike",
                 metadata = null,
-                screenshotPath = null,
+                screenshotData = null,
                 memoryUsageMb = null,
                 cpuUsagePercent = null
             )
@@ -325,7 +450,7 @@ object MetricsSDK {
             eventType = EventType.CRASH,
             eventName = "app_crash",
             metadata = stackTrace,
-            screenshotPath = null,
+            screenshotData = null,
             memoryUsageMb = null,
             cpuUsagePercent = null
         )
@@ -338,14 +463,20 @@ object MetricsSDK {
             EventType.ANR -> {
                 log("ANR detected from native")
                 if (config.enableScreenshots) {
-                    captureScreenshotForEvent("anr", sessionId, metadata)
+                    captureScreenshotForEvent(
+                        eventName = "anr",
+                        sessionId = sessionId,
+                        metadata = metadata,
+                        eventType = EventType.ANR,
+                        force = true // Critical event - bypass throttling
+                    )
                 } else {
                     repository.recordEvent(
                         sessionId = sessionId,
                         eventType = eventType,
                         eventName = name,
                         metadata = metadata,
-                        screenshotPath = null,
+                        screenshotData = null,
                         memoryUsageMb = null,
                         cpuUsagePercent = null
                     )
@@ -357,7 +488,7 @@ object MetricsSDK {
                     eventType = eventType,
                     eventName = name,
                     metadata = metadata,
-                    screenshotPath = null,
+                    screenshotData = null,
                     memoryUsageMb = null,
                     cpuUsagePercent = null
                 )
@@ -368,40 +499,45 @@ object MetricsSDK {
     private fun captureScreenshotForEvent(
         eventName: String,
         sessionId: String,
-        metadata: String?
+        metadata: String?,
+        eventType: EventType = EventType.HEAVY_ACTION,
+        force: Boolean = false
     ) {
         val activity = lifecycleTracker.getCurrentActivity() ?: return
 
         screenshotManager.captureScreenshot(
             activity = activity,
-            eventName = eventName,
             callback = object : ScreenshotManager.ScreenshotCallback {
-                override fun onSuccess(filePath: String) {
-                    log("Screenshot captured: $filePath")
+                override fun onSuccess(base64Data: String) {
+                    log("Screenshot captured (${base64Data.length} chars) for event: $eventName")
                     repository.recordEvent(
                         sessionId = sessionId,
-                        eventType = EventType.HEAVY_ACTION,
+                        eventType = eventType,
                         eventName = eventName,
                         metadata = metadata,
-                        screenshotPath = filePath,
+                        screenshotData = base64Data,
                         memoryUsageMb = null,
                         cpuUsagePercent = null
                     )
                 }
 
                 override fun onFailure(reason: String) {
-                    log("Screenshot failed: $reason")
-                    repository.recordEvent(
-                        sessionId = sessionId,
-                        eventType = EventType.HEAVY_ACTION,
-                        eventName = eventName,
-                        metadata = metadata,
-                        screenshotPath = null,
-                        memoryUsageMb = null,
-                        cpuUsagePercent = null
-                    )
+                    log("Screenshot skipped ($reason) for event: $eventName")
+                    // Only record event if it's a critical event or not throttled
+                    if (force || !reason.contains("Throttled")) {
+                        repository.recordEvent(
+                            sessionId = sessionId,
+                            eventType = eventType,
+                            eventName = eventName,
+                            metadata = metadata,
+                            screenshotData = null,
+                            memoryUsageMb = null,
+                            cpuUsagePercent = null
+                        )
+                    }
                 }
-            }
+            },
+            force = force
         )
     }
 
@@ -428,15 +564,19 @@ object MetricsSDK {
         try {
             lifecycleTracker.stop()
             
-            if (config.enableMemoryMonitoring) {
+            if (config.enableScreenshots && config.enableTouchTracking && ::touchInterceptor.isInitialized) {
+                touchInterceptor.stop()
+            }
+            
+            if (config.enableMemoryMonitoring && ::memoryMonitor.isInitialized) {
                 memoryMonitor.stop()
             }
             
-            if (config.enableAnrDetection) {
+            if (config.enableAnrDetection && ::anrWatchdog.isInitialized) {
                 anrWatchdog.stop()
             }
             
-            if (config.enableCrashReporting) {
+            if (config.enableCrashReporting && ::crashHandler.isInitialized) {
                 crashHandler.uninstall()
             }
             

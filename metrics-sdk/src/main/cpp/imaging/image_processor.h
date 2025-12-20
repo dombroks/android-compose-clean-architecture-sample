@@ -3,6 +3,7 @@
 
 #include <jni.h>
 #include <string>
+#include <vector>
 #include <mutex>
 #include <cstdint>
 
@@ -11,93 +12,72 @@ namespace metrics {
 /**
  * ImageProcessor - Native image processing engine
  * 
- * Handles bitmap downscaling and compression for screenshots.
- * Processes images off the main thread to prevent UI lag.
+ * Handles ALL image processing in C++:
+ * - Bitmap downscaling
+ * - JPEG compression
+ * - Base64 encoding
+ * 
+ * Kotlin only captures the bitmap (Android API requirement) and calls this.
  */
 class ImageProcessor {
 public:
-    struct ProcessingConfig {
-        int targetWidth;
-        int targetHeight;
-        int quality;           // 0-100 for JPEG/WebP
-        bool useWebP;          // true for WebP, false for JPEG
-    };
-
-    struct ProcessingResult {
-        bool success;
-        std::string filePath;
-        int originalWidth;
-        int originalHeight;
-        int processedWidth;
-        int processedHeight;
-        size_t originalSizeBytes;
-        size_t processedSizeBytes;
-        int64_t processingTimeMs;
-        std::string errorMessage;
-    };
-
     static ImageProcessor& getInstance();
 
     // Prevent copying
     ImageProcessor(const ImageProcessor&) = delete;
     ImageProcessor& operator=(const ImageProcessor&) = delete;
 
-    // Configuration
-    void setDefaultConfig(const ProcessingConfig& config);
-    ProcessingConfig getDefaultConfig() const;
+    /**
+     * Set processing configuration
+     */
+    void setConfig(int targetWidth, int targetHeight, int quality);
 
-    // Processing
-    ProcessingResult processAndSaveBitmap(
-        JNIEnv* env,
-        jobject bitmap,
-        const std::string& outputPath
-    );
+    /**
+     * Process bitmap and return base64-encoded JPEG string.
+     * This does ALL processing in C++:
+     * 1. Read bitmap pixels via JNI
+     * 2. Downscale to target dimensions
+     * 3. Compress to JPEG
+     * 4. Encode to base64
+     * 
+     * @param env JNI environment
+     * @param bitmap Android Bitmap object
+     * @return Base64-encoded JPEG string, or empty string on failure
+     */
+    std::string processAndEncode(JNIEnv* env, jobject bitmap);
 
-    ProcessingResult processAndSaveBitmapBuffer(
-        const uint8_t* pixelBuffer,
-        int width,
-        int height,
-        int stride,
-        const std::string& outputPath
-    );
+    /**
+     * Decode base64 string back to JPEG bytes.
+     * Useful for extracting/viewing screenshots.
+     */
+    static std::vector<uint8_t> base64Decode(const std::string& encoded);
 
-    // Utilities
-    void setStorageDirectory(const std::string& directory);
-    std::string getStorageDirectory() const;
-    std::string generateFilename(const std::string& prefix);
-
-    // Memory management
+    /**
+     * Set low memory state - will skip processing if true
+     */
+    void setLowMemory(bool isLowMemory);
     bool isLowMemory() const;
-    void setLowMemoryThreshold(size_t thresholdBytes);
 
 private:
     ImageProcessor();
     ~ImageProcessor();
 
-    bool downscalePixels(
+    std::vector<uint8_t> downscaleRGBA(
         const uint8_t* srcPixels,
         int srcWidth,
         int srcHeight,
         int srcStride,
-        uint8_t* dstPixels,
         int dstWidth,
         int dstHeight
     );
 
-    bool writeJpeg(
-        const uint8_t* pixels,
-        int width,
-        int height,
-        int quality,
-        const std::string& outputPath
-    );
-
-    int64_t getCurrentTimeMs() const;
+    static std::string base64Encode(const std::vector<uint8_t>& data);
 
     mutable std::mutex mutex_;
-    ProcessingConfig defaultConfig_{360, 640, 40, false}; // 360p, 40% quality, JPEG
-    std::string storageDirectory_;
-    size_t lowMemoryThreshold_{50 * 1024 * 1024}; // 50MB default
+    int targetWidth_;
+    int targetHeight_;
+    int quality_;
+    bool isLowMemory_;
 };
 
 } // namespace metrics

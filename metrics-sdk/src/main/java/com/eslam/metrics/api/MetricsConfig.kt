@@ -59,6 +59,25 @@ data class MetricsConfig(
     val screenshotHeight: Int = 640,
 
     /**
+     * Minimum interval between screenshots in milliseconds.
+     * Prevents capturing too many screenshots in rapid succession.
+     * Default: 1000ms (1 second)
+     */
+    val screenshotIntervalMs: Long = 1000,
+
+    /**
+     * Enable touch/click detection for automatic screenshot capture.
+     * Default: true
+     */
+    val enableTouchTracking: Boolean = true,
+
+    /**
+     * Capture screenshot on activity/page changes.
+     * Default: true
+     */
+    val captureOnPageChange: Boolean = true,
+
+    /**
      * Maximum age of stored data in days.
      * Default: 7
      */
@@ -80,6 +99,9 @@ data class MetricsConfig(
         private var screenshotQuality: Int = 40
         private var screenshotWidth: Int = 360
         private var screenshotHeight: Int = 640
+        private var screenshotIntervalMs: Long = 1000
+        private var enableTouchTracking: Boolean = true
+        private var captureOnPageChange: Boolean = true
         private var dataRetentionDays: Int = 7
         private var debugLogging: Boolean = false
 
@@ -92,6 +114,9 @@ data class MetricsConfig(
         fun screenshotQuality(value: Int) = apply { screenshotQuality = value.coerceIn(0, 100) }
         fun screenshotWidth(value: Int) = apply { screenshotWidth = value }
         fun screenshotHeight(value: Int) = apply { screenshotHeight = value }
+        fun screenshotIntervalMs(value: Long) = apply { screenshotIntervalMs = value.coerceAtLeast(100) }
+        fun enableTouchTracking(value: Boolean) = apply { enableTouchTracking = value }
+        fun captureOnPageChange(value: Boolean) = apply { captureOnPageChange = value }
         fun dataRetentionDays(value: Int) = apply { dataRetentionDays = value }
         fun debugLogging(value: Boolean) = apply { debugLogging = value }
 
@@ -105,6 +130,9 @@ data class MetricsConfig(
             screenshotQuality = screenshotQuality,
             screenshotWidth = screenshotWidth,
             screenshotHeight = screenshotHeight,
+            screenshotIntervalMs = screenshotIntervalMs,
+            enableTouchTracking = enableTouchTracking,
+            captureOnPageChange = captureOnPageChange,
             dataRetentionDays = dataRetentionDays,
             debugLogging = debugLogging
         )

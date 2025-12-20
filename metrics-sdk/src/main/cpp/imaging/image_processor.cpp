@@ -1,351 +1,243 @@
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 #include "image_processor.h"
 #include <android/log.h>
 #include <android/bitmap.h>
-#include <chrono>
-#include <fstream>
+#include <vector>
+#include <string>
 #include <cstring>
 #include <cmath>
-#include <sstream>
-#include <iomanip>
-#include <random>
+#include <mutex>
 
 #define LOG_TAG "MetricsSDK"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace metrics {
+
+// Base64 encoding table
+static const char base64_chars[] = 
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// JPEG write callback - appends to vector
+static void jpeg_write_callback(void* context, void* data, int size) {
+    std::vector<uint8_t>* buffer = static_cast<std::vector<uint8_t>*>(context);
+    uint8_t* bytes = static_cast<uint8_t*>(data);
+    buffer->insert(buffer->end(), bytes, bytes + size);
+}
 
 ImageProcessor& ImageProcessor::getInstance() {
     static ImageProcessor instance;
     return instance;
 }
 
-ImageProcessor::ImageProcessor() {
-    LOGI("ImageProcessor initialized");
+ImageProcessor::ImageProcessor() 
+    : targetWidth_(360), targetHeight_(640), quality_(40), isLowMemory_(false) {
+    LOGI("ImageProcessor initialized (C++ processing)");
 }
 
 ImageProcessor::~ImageProcessor() {
     LOGI("ImageProcessor destroyed");
 }
 
-int64_t ImageProcessor::getCurrentTimeMs() const {
-    auto now = std::chrono::system_clock::now();
-    auto duration = now.time_since_epoch();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-}
-
-void ImageProcessor::setDefaultConfig(const ProcessingConfig& config) {
+void ImageProcessor::setConfig(int targetWidth, int targetHeight, int quality) {
     std::lock_guard<std::mutex> lock(mutex_);
-    defaultConfig_ = config;
-    LOGD("Default config updated: %dx%d, quality=%d", 
-         config.targetWidth, config.targetHeight, config.quality);
+    targetWidth_ = targetWidth;
+    targetHeight_ = targetHeight;
+    quality_ = quality;
+    LOGD("Config set: %dx%d, quality=%d", targetWidth, targetHeight, quality);
 }
 
-ImageProcessor::ProcessingConfig ImageProcessor::getDefaultConfig() const {
+void ImageProcessor::setLowMemory(bool isLowMemory) {
     std::lock_guard<std::mutex> lock(mutex_);
-    return defaultConfig_;
+    isLowMemory_ = isLowMemory;
 }
 
-void ImageProcessor::setStorageDirectory(const std::string& directory) {
+bool ImageProcessor::isLowMemory() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    storageDirectory_ = directory;
-    LOGD("Storage directory set: %s", directory.c_str());
+    return isLowMemory_;
 }
 
-std::string ImageProcessor::getStorageDirectory() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return storageDirectory_;
-}
-
-std::string ImageProcessor::generateFilename(const std::string& prefix) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(1000, 9999);
+std::string ImageProcessor::base64Encode(const std::vector<uint8_t>& data) {
+    std::string result;
+    result.reserve(((data.size() + 2) / 3) * 4);
     
-    auto now = std::chrono::system_clock::now();
-    auto time = std::chrono::system_clock::to_time_t(now);
+    size_t i = 0;
+    size_t len = data.size();
     
-    std::stringstream ss;
-    ss << prefix << "_" << time << "_" << dis(gen) << ".jpg";
-    
-    return ss.str();
-}
-
-ImageProcessor::ProcessingResult ImageProcessor::processAndSaveBitmap(
-    JNIEnv* env,
-    jobject bitmap,
-    const std::string& outputPath
-) {
-    ProcessingResult result{};
-    result.success = false;
-    
-    int64_t startTime = getCurrentTimeMs();
-    
-    if (env == nullptr || bitmap == nullptr) {
-        result.errorMessage = "Invalid JNI environment or bitmap";
-        LOGE("%s", result.errorMessage.c_str());
-        return result;
+    while (i < len) {
+        uint32_t octet_a = i < len ? data[i++] : 0;
+        uint32_t octet_b = i < len ? data[i++] : 0;
+        uint32_t octet_c = i < len ? data[i++] : 0;
+        
+        uint32_t triple = (octet_a << 16) + (octet_b << 8) + octet_c;
+        
+        result += base64_chars[(triple >> 18) & 0x3F];
+        result += base64_chars[(triple >> 12) & 0x3F];
+        result += (i > len + 1) ? '=' : base64_chars[(triple >> 6) & 0x3F];
+        result += (i > len) ? '=' : base64_chars[triple & 0x3F];
     }
-    
-    AndroidBitmapInfo info;
-    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) {
-        result.errorMessage = "Failed to get bitmap info";
-        LOGE("%s", result.errorMessage.c_str());
-        return result;
-    }
-    
-    result.originalWidth = static_cast<int>(info.width);
-    result.originalHeight = static_cast<int>(info.height);
-    result.originalSizeBytes = info.stride * info.height;
-    
-    LOGD("Processing bitmap: %dx%d, stride=%d, format=%d",
-         result.originalWidth, result.originalHeight, info.stride, info.format);
-    
-    // Lock pixels
-    void* pixels = nullptr;
-    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
-        result.errorMessage = "Failed to lock bitmap pixels";
-        LOGE("%s", result.errorMessage.c_str());
-        return result;
-    }
-    
-    // Get config
-    ProcessingConfig config = getDefaultConfig();
-    
-    // Calculate target dimensions maintaining aspect ratio
-    float aspectRatio = static_cast<float>(result.originalWidth) / result.originalHeight;
-    int targetWidth = config.targetWidth;
-    int targetHeight = static_cast<int>(targetWidth / aspectRatio);
-    
-    if (targetHeight > config.targetHeight) {
-        targetHeight = config.targetHeight;
-        targetWidth = static_cast<int>(targetHeight * aspectRatio);
-    }
-    
-    // Allocate buffer for downscaled image
-    std::vector<uint8_t> scaledPixels(targetWidth * targetHeight * 4);
-    
-    // Downscale
-    bool scaleSuccess = downscalePixels(
-        static_cast<uint8_t*>(pixels),
-        result.originalWidth,
-        result.originalHeight,
-        static_cast<int>(info.stride),
-        scaledPixels.data(),
-        targetWidth,
-        targetHeight
-    );
-    
-    // Unlock pixels
-    AndroidBitmap_unlockPixels(env, bitmap);
-    
-    if (!scaleSuccess) {
-        result.errorMessage = "Failed to downscale image";
-        LOGE("%s", result.errorMessage.c_str());
-        return result;
-    }
-    
-    result.processedWidth = targetWidth;
-    result.processedHeight = targetHeight;
-    
-    // Write to file (simple raw format for now, can be extended to JPEG)
-    bool writeSuccess = writeJpeg(
-        scaledPixels.data(),
-        targetWidth,
-        targetHeight,
-        config.quality,
-        outputPath
-    );
-    
-    if (!writeSuccess) {
-        result.errorMessage = "Failed to write image file";
-        LOGE("%s", result.errorMessage.c_str());
-        return result;
-    }
-    
-    result.filePath = outputPath;
-    result.success = true;
-    result.processingTimeMs = getCurrentTimeMs() - startTime;
-    
-    // Get file size
-    std::ifstream file(outputPath, std::ios::binary | std::ios::ate);
-    if (file.is_open()) {
-        result.processedSizeBytes = static_cast<size_t>(file.tellg());
-        file.close();
-    }
-    
-    LOGI("Image processed: %dx%d -> %dx%d, %zu -> %zu bytes, %lldms",
-         result.originalWidth, result.originalHeight,
-         result.processedWidth, result.processedHeight,
-         result.originalSizeBytes, result.processedSizeBytes,
-         result.processingTimeMs);
     
     return result;
 }
 
-ImageProcessor::ProcessingResult ImageProcessor::processAndSaveBitmapBuffer(
-    const uint8_t* pixelBuffer,
-    int width,
-    int height,
-    int stride,
-    const std::string& outputPath
-) {
-    ProcessingResult result{};
-    result.success = false;
-    
-    int64_t startTime = getCurrentTimeMs();
-    
-    if (pixelBuffer == nullptr || width <= 0 || height <= 0) {
-        result.errorMessage = "Invalid pixel buffer or dimensions";
-        LOGE("%s", result.errorMessage.c_str());
-        return result;
-    }
-    
-    result.originalWidth = width;
-    result.originalHeight = height;
-    result.originalSizeBytes = stride * height;
-    
-    // Get config
-    ProcessingConfig config = getDefaultConfig();
-    
-    // Calculate target dimensions
-    float aspectRatio = static_cast<float>(width) / height;
-    int targetWidth = config.targetWidth;
-    int targetHeight = static_cast<int>(targetWidth / aspectRatio);
-    
-    if (targetHeight > config.targetHeight) {
-        targetHeight = config.targetHeight;
-        targetWidth = static_cast<int>(targetHeight * aspectRatio);
-    }
-    
-    // Allocate and downscale
-    std::vector<uint8_t> scaledPixels(targetWidth * targetHeight * 4);
-    
-    bool scaleSuccess = downscalePixels(
-        pixelBuffer, width, height, stride,
-        scaledPixels.data(), targetWidth, targetHeight
-    );
-    
-    if (!scaleSuccess) {
-        result.errorMessage = "Failed to downscale image";
-        return result;
-    }
-    
-    result.processedWidth = targetWidth;
-    result.processedHeight = targetHeight;
-    
-    // Write
-    bool writeSuccess = writeJpeg(
-        scaledPixels.data(), targetWidth, targetHeight,
-        config.quality, outputPath
-    );
-    
-    if (!writeSuccess) {
-        result.errorMessage = "Failed to write image file";
-        return result;
-    }
-    
-    result.filePath = outputPath;
-    result.success = true;
-    result.processingTimeMs = getCurrentTimeMs() - startTime;
-    
-    return result;
-}
-
-bool ImageProcessor::downscalePixels(
-    const uint8_t* srcPixels,
-    int srcWidth,
+std::vector<uint8_t> ImageProcessor::downscaleRGBA(
+    const uint8_t* srcPixels, 
+    int srcWidth, 
     int srcHeight,
     int srcStride,
-    uint8_t* dstPixels,
-    int dstWidth,
+    int dstWidth, 
     int dstHeight
 ) {
-    if (srcPixels == nullptr || dstPixels == nullptr) {
-        return false;
-    }
+    // Output is RGB (3 bytes per pixel) for JPEG encoding
+    std::vector<uint8_t> dst(dstWidth * dstHeight * 3);
     
-    // Bilinear interpolation downscaling
     float xRatio = static_cast<float>(srcWidth) / dstWidth;
     float yRatio = static_cast<float>(srcHeight) / dstHeight;
     
     for (int y = 0; y < dstHeight; ++y) {
         for (int x = 0; x < dstWidth; ++x) {
-            float srcX = x * xRatio;
-            float srcY = y * yRatio;
+            // Simple nearest-neighbor for speed
+            int srcX = static_cast<int>(x * xRatio);
+            int srcY = static_cast<int>(y * yRatio);
             
-            int x0 = static_cast<int>(srcX);
-            int y0 = static_cast<int>(srcY);
-            int x1 = std::min(x0 + 1, srcWidth - 1);
-            int y1 = std::min(y0 + 1, srcHeight - 1);
+            srcX = std::min(srcX, srcWidth - 1);
+            srcY = std::min(srcY, srcHeight - 1);
             
-            float xFrac = srcX - x0;
-            float yFrac = srcY - y0;
+            const uint8_t* srcPixel = srcPixels + (srcY * srcStride) + (srcX * 4);
+            uint8_t* dstPixel = dst.data() + (y * dstWidth + x) * 3;
             
-            // RGBA (4 bytes per pixel)
-            for (int c = 0; c < 4; ++c) {
-                float p00 = srcPixels[y0 * srcStride + x0 * 4 + c];
-                float p10 = srcPixels[y0 * srcStride + x1 * 4 + c];
-                float p01 = srcPixels[y1 * srcStride + x0 * 4 + c];
-                float p11 = srcPixels[y1 * srcStride + x1 * 4 + c];
-                
-                float value = (1 - xFrac) * (1 - yFrac) * p00 +
-                              xFrac * (1 - yFrac) * p10 +
-                              (1 - xFrac) * yFrac * p01 +
-                              xFrac * yFrac * p11;
-                
-                dstPixels[y * dstWidth * 4 + x * 4 + c] = 
-                    static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, value)));
-            }
+            // ARGB_8888 format: R, G, B, A -> copy RGB only
+            dstPixel[0] = srcPixel[0]; // R
+            dstPixel[1] = srcPixel[1]; // G
+            dstPixel[2] = srcPixel[2]; // B
         }
     }
     
-    return true;
+    return dst;
 }
 
-bool ImageProcessor::writeJpeg(
-    const uint8_t* pixels,
-    int width,
-    int height,
-    int quality,
-    const std::string& outputPath
+std::string ImageProcessor::processAndEncode(
+    JNIEnv* env,
+    jobject bitmap
 ) {
-    // Simple raw RGBA file for now
-    // In production, would use libjpeg-turbo or similar
-    // For this implementation, we'll write a simple binary format
-    
-    std::ofstream file(outputPath, std::ios::binary);
-    if (!file.is_open()) {
-        LOGE("Failed to open file for writing: %s", outputPath.c_str());
-        return false;
+    if (isLowMemory()) {
+        LOGD("Low memory - skipping screenshot");
+        return "";
     }
     
-    // Write header (simple format: width, height, then pixels)
-    file.write(reinterpret_cast<const char*>(&width), sizeof(width));
-    file.write(reinterpret_cast<const char*>(&height), sizeof(height));
-    file.write(reinterpret_cast<const char*>(&quality), sizeof(quality));
+    if (env == nullptr || bitmap == nullptr) {
+        LOGE("Invalid JNI environment or bitmap");
+        return "";
+    }
     
-    // Write pixel data
-    size_t pixelDataSize = width * height * 4;
-    file.write(reinterpret_cast<const char*>(pixels), pixelDataSize);
+    // Get bitmap info
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("Failed to get bitmap info");
+        return "";
+    }
     
-    file.close();
+    LOGD("Processing bitmap: %dx%d, stride=%d, format=%d",
+         info.width, info.height, info.stride, info.format);
     
-    LOGD("Written image to: %s", outputPath.c_str());
-    return true;
+    // Lock pixels
+    void* pixels = nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("Failed to lock bitmap pixels");
+        return "";
+    }
+    
+    // Calculate target dimensions maintaining aspect ratio
+    int targetW, targetH;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        float aspectRatio = static_cast<float>(info.width) / info.height;
+        targetW = targetWidth_;
+        targetH = static_cast<int>(targetW / aspectRatio);
+        
+        if (targetH > targetHeight_) {
+            targetH = targetHeight_;
+            targetW = static_cast<int>(targetH * aspectRatio);
+        }
+    }
+    
+    // Downscale to RGB
+    std::vector<uint8_t> rgbData = downscaleRGBA(
+        static_cast<uint8_t*>(pixels),
+        info.width,
+        info.height,
+        info.stride,
+        targetW,
+        targetH
+    );
+    
+    // Unlock pixels - we're done with the bitmap
+    AndroidBitmap_unlockPixels(env, bitmap);
+    
+    // Compress to JPEG
+    std::vector<uint8_t> jpegData;
+    jpegData.reserve(targetW * targetH); // Rough estimate
+    
+    int quality;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        quality = quality_;
+    }
+    
+    int result = stbi_write_jpg_to_func(
+        jpeg_write_callback,
+        &jpegData,
+        targetW,
+        targetH,
+        3, // RGB components
+        rgbData.data(),
+        quality
+    );
+    
+    if (result == 0) {
+        LOGE("Failed to compress JPEG");
+        return "";
+    }
+    
+    // Encode to base64
+    std::string base64 = base64Encode(jpegData);
+    
+    LOGI("Screenshot processed: %dx%d -> %dx%d, JPEG=%zu bytes, Base64=%zu chars",
+         (int)info.width, (int)info.height, targetW, targetH, 
+         jpegData.size(), base64.size());
+    
+    return base64;
 }
 
-bool ImageProcessor::isLowMemory() const {
-    // This would typically check actual system memory
-    // For now, return false (not in low memory state)
-    return false;
-}
-
-void ImageProcessor::setLowMemoryThreshold(size_t thresholdBytes) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    lowMemoryThreshold_ = thresholdBytes;
+// Decode base64 to bytes (for extracting images)
+std::vector<uint8_t> ImageProcessor::base64Decode(const std::string& encoded) {
+    std::vector<uint8_t> result;
+    
+    if (encoded.empty()) return result;
+    
+    // Build decode table
+    int decodeTable[256];
+    memset(decodeTable, -1, sizeof(decodeTable));
+    for (int i = 0; i < 64; i++) {
+        decodeTable[(unsigned char)base64_chars[i]] = i;
+    }
+    
+    result.reserve(encoded.size() * 3 / 4);
+    
+    int val = 0, valb = -8;
+    for (unsigned char c : encoded) {
+        if (decodeTable[c] == -1) break;
+        val = (val << 6) + decodeTable[c];
+        valb += 6;
+        if (valb >= 0) {
+            result.push_back((val >> valb) & 0xFF);
+            valb -= 8;
+        }
+    }
+    
+    return result;
 }
 
 } // namespace metrics

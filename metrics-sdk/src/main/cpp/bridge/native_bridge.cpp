@@ -49,11 +49,10 @@ Java_com_eslam_metrics_internal_bridge_NativeBridge_nativeInit(
     jobject thiz,
     jstring storagePath
 ) {
+    // Storage path kept for potential future use, but screenshots are now base64
     const char* path = env->GetStringUTFChars(storagePath, nullptr);
-    ImageProcessor::getInstance().setStorageDirectory(path);
+    LOGI("Native SDK initialized");
     env->ReleaseStringUTFChars(storagePath, path);
-    
-    LOGI("Native SDK initialized with storage: %s", path);
 }
 
 JNIEXPORT void JNICALL
@@ -290,27 +289,55 @@ Java_com_eslam_metrics_internal_bridge_NativeBridge_nativeRecordCrash(
     env->ReleaseStringUTFChars(stackTrace, stackTraceStr);
 }
 
-// ==================== Image Processing ====================
+// ==================== Image Processing (ALL in C++) ====================
 
+/**
+ * Process bitmap in C++ and return base64-encoded JPEG string.
+ * All processing happens in native:
+ * 1. Read bitmap pixels
+ * 2. Downscale
+ * 3. Compress to JPEG
+ * 4. Encode to base64
+ */
 JNIEXPORT jstring JNICALL
-Java_com_eslam_metrics_internal_bridge_NativeBridge_nativeProcessBitmap(
+Java_com_eslam_metrics_internal_bridge_NativeBridge_nativeProcessBitmapToBase64(
     JNIEnv* env,
     jobject thiz,
-    jobject bitmap,
-    jstring outputPath
+    jobject bitmap
 ) {
-    const char* pathStr = env->GetStringUTFChars(outputPath, nullptr);
-    std::string path(pathStr);
-    env->ReleaseStringUTFChars(outputPath, pathStr);
+    std::string base64 = ImageProcessor::getInstance().processAndEncode(env, bitmap);
     
-    auto result = ImageProcessor::getInstance().processAndSaveBitmap(env, bitmap, path);
-    
-    if (result.success) {
-        return env->NewStringUTF(result.filePath.c_str());
-    } else {
-        LOGE("Image processing failed: %s", result.errorMessage.c_str());
+    if (base64.empty()) {
         return nullptr;
     }
+    
+    return env->NewStringUTF(base64.c_str());
+}
+
+/**
+ * Decode base64 string back to JPEG bytes.
+ * Used for extracting/viewing screenshots.
+ */
+JNIEXPORT jbyteArray JNICALL
+Java_com_eslam_metrics_internal_bridge_NativeBridge_nativeDecodeBase64ToBytes(
+    JNIEnv* env,
+    jobject thiz,
+    jstring base64String
+) {
+    const char* base64Str = env->GetStringUTFChars(base64String, nullptr);
+    std::string encoded(base64Str);
+    env->ReleaseStringUTFChars(base64String, base64Str);
+    
+    std::vector<uint8_t> bytes = ImageProcessor::base64Decode(encoded);
+    
+    if (bytes.empty()) {
+        return nullptr;
+    }
+    
+    jbyteArray result = env->NewByteArray(bytes.size());
+    env->SetByteArrayRegion(result, 0, bytes.size(), reinterpret_cast<jbyte*>(bytes.data()));
+    
+    return result;
 }
 
 JNIEXPORT void JNICALL
@@ -319,16 +346,18 @@ Java_com_eslam_metrics_internal_bridge_NativeBridge_nativeSetImageConfig(
     jobject thiz,
     jint targetWidth,
     jint targetHeight,
-    jint quality,
-    jboolean useWebP
+    jint quality
 ) {
-    ImageProcessor::ProcessingConfig config{
-        targetWidth,
-        targetHeight,
-        quality,
-        static_cast<bool>(useWebP)
-    };
-    ImageProcessor::getInstance().setDefaultConfig(config);
+    ImageProcessor::getInstance().setConfig(targetWidth, targetHeight, quality);
+}
+
+JNIEXPORT void JNICALL
+Java_com_eslam_metrics_internal_bridge_NativeBridge_nativeSetLowMemory(
+    JNIEnv* env,
+    jobject thiz,
+    jboolean isLowMemory
+) {
+    ImageProcessor::getInstance().setLowMemory(static_cast<bool>(isLowMemory));
 }
 
 JNIEXPORT jboolean JNICALL

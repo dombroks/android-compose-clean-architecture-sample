@@ -8,6 +8,9 @@ import androidx.room.PrimaryKey
 
 /**
  * EventEntity - Room entity for storing events
+ * 
+ * Screenshots are stored as base64-encoded JPEG data for efficient
+ * transfer to backend without file I/O overhead.
  */
 @Entity(
     tableName = "events",
@@ -40,8 +43,13 @@ internal data class EventEntity(
     @ColumnInfo(name = "metadata_json")
     val metadataJson: String? = null,
 
-    @ColumnInfo(name = "screenshot_path")
-    val screenshotPath: String? = null,
+    /**
+     * Base64-encoded JPEG screenshot data.
+     * Compressed and downscaled for minimal size.
+     * Backend processes the actual image.
+     */
+    @ColumnInfo(name = "screenshot_data")
+    val screenshotData: String? = null,
 
     @ColumnInfo(name = "memory_usage_mb")
     val memoryUsageMb: Long? = null,

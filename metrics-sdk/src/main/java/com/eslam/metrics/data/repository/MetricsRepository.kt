@@ -74,12 +74,17 @@ internal class MetricsRepository(context: Context) {
 
     // Event operations
 
+    /**
+     * Record an event with optional base64-encoded screenshot data.
+     * 
+     * @param screenshotData Base64-encoded JPEG data (processed by backend)
+     */
     fun recordEvent(
         sessionId: String,
         eventType: EventType,
         eventName: String,
         metadata: String?,
-        screenshotPath: String?,
+        screenshotData: String?,
         memoryUsageMb: Long?,
         cpuUsagePercent: Float?
     ) {
@@ -90,7 +95,7 @@ internal class MetricsRepository(context: Context) {
                 eventName = eventName,
                 timestamp = System.currentTimeMillis(),
                 metadataJson = metadata,
-                screenshotPath = screenshotPath,
+                screenshotData = screenshotData,
                 memoryUsageMb = memoryUsageMb,
                 cpuUsagePercent = cpuUsagePercent
             )
