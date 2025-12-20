@@ -129,7 +129,7 @@ object MetricsSDK {
             application = application,
             onForeground = ::onAppForeground,
             onBackground = ::onAppBackground,
-            onActivityResumed = ::onActivityResumed,
+            onActivityResumedCallback = ::onActivityResumed,
             gracePeriodMs = config.gracePeriodMs
         )
         lifecycleTracker.start()

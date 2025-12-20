@@ -19,7 +19,7 @@ internal class LifecycleTracker(
     private val application: Application,
     private val onForeground: () -> Unit,
     private val onBackground: () -> Unit,
-    private val onActivityResumed: (Activity) -> Unit,
+    private val onActivityResumedCallback: (Activity) -> Unit,
     private val gracePeriodMs: Long = 5000
 ) : DefaultLifecycleObserver, Application.ActivityLifecycleCallbacks {
 
@@ -79,7 +79,7 @@ internal class LifecycleTracker(
 
     override fun onActivityResumed(activity: Activity) {
         currentActivity = activity
-        onActivityResumed(activity)
+        onActivityResumedCallback(activity)
     }
 
     override fun onActivityPaused(activity: Activity) {
