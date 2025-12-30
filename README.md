@@ -705,6 +705,7 @@ Detailed documentation is available in the `/docs` folder:
 | [testing.md](docs/testing.md) | Testing strategy and examples |
 | [performance.md](docs/performance.md) | Performance optimization guide |
 | [compose_guidelines.md](docs/compose_guidelines.md) | Jetpack Compose best practices |
+| [pr_review_guide.md](docs/pr_review_guide.md) | PR review guidelines and best practices |
 | [interview_questions.md](docs/interview_questions.md) | Senior Android interview Q&A |
 
 ---
